@@ -1,32 +1,66 @@
 #!/bin/bash
-echo "🩹 Step 5: Applying source patches..."
+set -e
 
-NODE_LLAMA_DIR="$HOME/.nvm/versions/node/$(node -v)/lib/node_modules/@tobilu/qmd/node_modules/node-llama-cpp"
+echo "🔧 Applying WSL2 CUDA Context Patch..."
 
-# Clean old source
-rm -rf "$NODE_LLAMA_DIR/llama/llama.cpp" "$NODE_LLAMA_DIR/llama/localBuilds"
+NODE_DIR=$(npm root -g)/@tobilu/qmd/node_modules/node-llama-cpp
+TARGET_FILE="$NODE_DIR/llama/addon/addon.cpp"
 
-# Download base source
-echo "   Downloading base source via CLI..."
-cd "$NODE_LLAMA_DIR"
-node dist/cli/cli.js source download --gpu cuda
+if [ ! -f "$TARGET_FILE" ]; then
+    echo "Error: $TARGET_FILE not found. Is node-llama-cpp installed?"
+    exit 1
+fi
 
-# Replace with latest master
-echo "   Replacing with latest llama.cpp master..."
-cd "$NODE_LLAMA_DIR/llama"
-git clone --depth 1 https://github.com/ggml-org/llama.cpp.git
+# 1. Headers
+grep -q '#include <dlfcn.h>' "$TARGET_FILE" || sed -i '1i\#include <dlfcn.h>' "$TARGET_FILE"
+grep -q '#include <cuda.h>' "$TARGET_FILE" || sed -i '1i\#include <cuda.h>' "$TARGET_FILE"
 
-# Apply VMM fix
-echo "   Applying VMM crash fix..."
-sed -i '1i\add_definitions(-DGGML_CUDA_NO_VMM)' "$NODE_LLAMA_DIR/llama/llama.cpp/CMakeLists.txt"
+# 2. Python Patch
+python3 -c "
+import re
+import sys
 
-# Apply API compatibility patches
-echo "   Applying API compatibility patches..."
-find "$NODE_LLAMA_DIR/llama/addon/" -name "*.cpp" -exec sed -i 's/cpu_get_num_math/common_cpu_get_num_math/g' {} \;
-find "$NODE_LLAMA_DIR/llama/addon/" -name "*.cpp" -exec sed -i 's/common_common_cpu_get_num_math/common_cpu_get_num_math/g' {} \;
+target_file = '$TARGET_FILE'
+with open(target_file, 'r') as f: 
+    content = f.read()
 
-# Fix library naming
-sed -i 's/target_link_libraries(${PROJECT_NAME} "common")/target_link_libraries(${PROJECT_NAME} "llama-common")/g' "$NODE_LLAMA_DIR/llama/CMakeLists.txt"
-sed -i 's/target_link_libraries(llama-addon "common")/target_link_libraries(llama-addon "llama-common")/g' "$NODE_LLAMA_DIR/llama/CMakeLists.txt"
+func_code = '''
+// WSL2 Fix: Force load CUDA driver
+static void wsl_cuda_preinit() {
+    void* handle = dlopen("/usr/lib/wsl/lib/libcuda.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+        fprintf(stderr, "[WSL2-CUDA] Failed to preload libcuda.so: %s\n", dlerror());
+        return;
+    }
+    typedef CUresult (*cuInit_fn)(unsigned int);
+    cuInit_fn my_cuInit = (cuInit_fn)dlsym(handle, "cuInit");
+    if (my_cuInit) {
+        CUresult res = my_cuInit(0);
+        if (res == 0) {
+            fprintf(stderr, "[WSL2-CUDA] Pre-init cuInit result: 0 (SUCCESS)\n");
+        } else {
+            fprintf(stderr, "[WSL2-CUDA] Pre-init cuInit result: %d (FAILED)\n", res);
+        }
+    }
+}
+'''
 
-echo "✅ All patches applied"
+if 'wsl_cuda_preinit' not in content:
+    match = re.search(r'(Napi::Object\s+registerCallback\s*\([^)]*\)\s*\{)', content)
+    if match:
+        content = content[:match.start()] + func_code + '\n' + content[match.start():]
+        brace_pos = content.find('{', match.start() + len(func_code))
+        if brace_pos != -1:
+            content = content[:brace_pos+1] + '\n    // WSL2 Fix\n    wsl_cuda_preinit();' + content[brace_pos+1:]
+            with open(target_file, 'w') as f: 
+                f.write(content)
+            print('Patch applied.')
+        else:
+            print('Could not find {')
+    else:
+        print('Could not find registerCallback')
+else:
+    print('Patch already applied.')
+"
+
+echo "✅ Patch complete."
